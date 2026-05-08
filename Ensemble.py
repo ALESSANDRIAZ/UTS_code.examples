@@ -1,0 +1,230 @@
+from multiprocessing import pool
+
+import numpy as np
+from functools import cached_property
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import multiprocessing as mp
+
+from data import EnsembleParameters, ModelParameters, AxisData, CurrentData
+from core import Model
+
+class Ensemble:
+    """Runs a collection of model instances and finds the overall results of the model."""
+
+    def __init__(self, params: EnsembleParameters) -> None:
+        """
+        Creates an ensemble instance.
+        
+        Parameters
+        ----------
+        params : EnsembleParameters
+            The parameters for the ensemble.
+        """
+
+        self.__params = params
+
+        # Stores the models in a dictionary.
+        self.__models: dict[tuple[float, float], Model] = {}
+        # The axis data shared by the system.
+        self.__axes = None
+
+    def AddMomentum(self, kValues: tuple[float, float] | list[tuple[float, float]] | np.ndarray[float]) -> None:
+        """
+        Adds one or more momentum points to the simulation.
+        
+        Parameters
+        ----------
+        kValues: tuple[float, float] | list[tuple[float, float]] | np.ndarray[float]
+            The momentum points to simulate. Can be given as a single tuple containing
+            (kx, ky), a list of tuples of that form, or a numpy array of shape (..., 2)
+            where [:, 0] gives all of the kx values and [:, 1] gives all of the ky values.
+
+            If inputting a single momentum value, must input as a tuple or a list with a single
+            tuple in it - the shape of the numpy array becomes broken if we only give one kx, ky pair.
+        """
+
+        # If input is a tuple, make it a list of tuples.
+        if isinstance(kValues, tuple):
+            kValues = [kValues]
+
+        # Now, iterating through kValues will return either tuples, or a 2 element
+        # numpy array since we will by default iterate over the first dimension.
+        # Either way, the following iteration code works. 
+        for k in kValues:
+            # Create the model parameters from the ensemble parameters.
+            modelParams = ModelParameters.FromEnsemble(
+                kx = k[0],
+                ky = k[1],
+                params = self.__params
+            )
+
+            # Stores the model in the dictionary with its momentum
+            # tuple as the key.
+            self.__models[(k[0], k[1])] = Model(modelParams)
+
+    def Run(self, tauMax: float, numProcesses: int | None=1) -> None:
+        """
+        Runs all of the models.
+
+        Parameters
+        ----------
+        tauMax : float
+            The maximum non-dimensional time the system will solve for.
+        numProcesses : int | None, optional
+            The number of processes to use when running the models. If None, will use all but
+            one core (unless we only have 1 core, in which case we will use 1 core).
+            Otherwise, input will be clamped between 1 and the number of cores.
+
+            If 1 is given, multiprocessing won't be used and the models will just be run
+            sequentially.
+
+            WARNING: It is possible to manually choose to use all cores of the machine.
+            This may cause unintended behaviour.
+        """
+
+        # Sanitizes the numProcesses input.
+        if numProcesses is None:
+            # Uses all but one core, unless we only have one core.
+            numProcesses = np.max([1, mp.cpu_count() - 1])   
+        else:
+            # Clamps the number of processes between 1 and the number of cores. 
+            # Note that it is possible to manually set the number of processes to
+            # be equal to the number of cores.
+            np.clip(numProcesses, 1, mp.cpu_count())
+
+        self.__axes = self.__CreateAxes(tauMax)
+
+        if numProcesses == 1:
+            for model in tqdm(self.__models.values(), desc=f"Running models (Delta = {self.__params.delta})"):
+                model.Run(self.__axes)
+
+        else:
+            # Creates the list of arguments for each model.
+            tasks = [(key, model, self.__axes) for key, model in self.__models.items()]
+
+            ctx = mp.get_context('spawn')
+            with ctx.Pool(processes=numProcesses) as pool:
+                # Note: if very slow, worth trying map instead of imap, since
+                # appparently imap can be much slower than map.
+                results = list(tqdm(
+                                pool.imap(
+                                    self._MultiProcessingRun,
+                                    tasks,
+                                    chunksize = len(tasks) // (numProcesses * 4) + 1
+                                ),
+                                total=len(tasks),
+                                desc=f"Running models (Delta = {self.__params.delta})"
+                            ))
+                
+            # Writes the models back into the dictionary, since the newly ran models live
+            # in another process and so must be explicitly returned and replaced in the dictionary.
+            self.__models = {key : model for key, model in results}
+
+    def _MultiProcessingRun(self, args: tuple[tuple[float, float], Model, AxisData]) -> tuple[tuple[float, float], Model]:
+        """
+        Creates a process to run the model. Utilised by Run() to
+        run the models in parallel.
+
+        Parameters
+        ----------
+        args : tuple[tuple[float, float], Model, AxisData]
+            Contains the arguments for the function, passed in as an argument.
+            First element is the momentum tuple associated with the model. Required to
+            store the results in the correct place in self.__models.
+            Second element is the model instance to run.
+            Third element is the axis data to run the model with. Required due to
+            the fact that we cannot share self.__axes between processes. 
+
+        Returns
+        -------
+        tuple[float, float]
+            Returns the key so that we can store the results in the appropriate place in self.__models.
+        Model
+            The model instance after it has been run.
+        """
+
+        key, model, axes = args
+        
+        model.Run(axes)
+        return key, model
+
+    def SampleBrillouinZone(self, numK: int) -> None:
+        """
+        Samples the Brillouin Zone (kx, ky in [-pi, pi]) using a
+        numK-by-numK grid.
+
+        This function automatically adds the models with the associated
+        momentum values to the ensemble.
+        
+        Parameters
+        ----------
+        numK : int
+            The side length of the grid we want to sample.
+        """
+
+        offsetX, offsetY = 0, 0
+        # print(f"x-offset: {offsetX}, y-offset: {offsetY}")
+        xPoints = np.linspace(-np.pi + offsetX, np.pi - offsetX, numK, endpoint=False) + np.pi / numK
+        yPoints = np.linspace(-np.pi + offsetY, np.pi - offsetY, numK, endpoint=False) + np.pi / numK
+        x, y = np.meshgrid(xPoints, yPoints)
+
+        # plt.scatter(x / np.pi, y / np.pi, s=2, color='black')
+        # plt.grid(True, which='both')
+        # plt.axis('equal')
+        # plt.show()
+
+        # Masks our the (0, 0) point, since the code breaks there.
+        # Better than enforcing that numK has to be even.
+        zeroMask = (x == 0) & (y == 0)
+        x = x[~zeroMask]
+        y = y[~zeroMask]
+         
+        # Stacks x and y so that the last axis differentiates between them.
+        momentums = np.stack((x.flatten(), y.flatten()), axis=-1)
+
+        # Adds the momentum points to the ensemble.
+        self.AddMomentum(momentums)
+
+    def __CreateAxes(self, tauMax: float) -> AxisData:
+        """
+        Creates the axis data used for each model.
+        
+        Parameters
+        ----------
+        tauMax : float
+            The maximum non-dimensional time the system will solve for.
+
+        Returns
+        -------
+        AxisData:
+            The object containing the axis data.
+        """
+
+        tauAxisDim = np.linspace(0, tauMax, 4000)
+        tauAxisSec = tauAxisDim / self.__params.decayConstant
+
+        sampleSpacing = (np.max(tauAxisSec) - np.min(tauAxisSec)) / tauAxisSec.size
+        freqAxis = np.fft.fftshift(np.fft.fftfreq(tauAxisSec.size, sampleSpacing)) / self.__params.drivingFreq
+
+        return AxisData(
+            tauAxisDim = tauAxisDim,
+            tauAxisSec = tauAxisSec,
+            freqAxis = freqAxis
+        )
+    
+    @cached_property
+    def summedCurrent(self) -> CurrentData:
+        return np.sum([model.currentData for model in self.__models.values()])
+    
+    @property
+    def axes(self) -> AxisData:
+        return self.__axes
+    
+    @property
+    def params(self) -> EnsembleParameters:
+        return self.__params
+    
+    @property
+    def models(self) -> dict[tuple[float, float], Model]:
+        return self.__models
